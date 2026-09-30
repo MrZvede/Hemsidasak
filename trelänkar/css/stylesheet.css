@@ -1,0 +1,26 @@
+a{
+    display: inline-block;
+    width: 200px;
+    height: 100px;
+    background-image: radial-gradient(red, yellow, green);
+    border: 4px black dashed;
+    padding: 10px 5px 10px 5px;
+    margin: 10px 10px 10px 10px;
+    box-sizing: border-box;
+    text-align: center;
+    text-decoration: wavy;
+    font-size: 3rem;
+}
+
+header{
+    display: grid;
+    height: 50vh;
+    background-image: linear-gradient(to bottom, navy, black);
+    grid-template-columns: 30% 40% 30%;
+    grid-template-rows: 30% 40% 30%;
+}
+
+a:hover{
+    background-image: radial-gradient(green, yellow, red);
+    border: 10px red dashed;
+}
