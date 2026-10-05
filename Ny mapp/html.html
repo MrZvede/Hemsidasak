@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Neon Cube Split</title>
+<style>
+  :root { box-sizing: border-box; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
+  html, body { height: 100%; margin: 0; background: #05060c; color: #8fe; font-family: ui-monospace, Menlo, monospace; overflow: hidden; }
+  #game { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+  #hud { position: fixed; left: 16px; top: calc(env(safe-area-inset-top, 0px) + 14px); font-size: 13px; letter-spacing: .15em; text-transform: uppercase; text-shadow: 0 0 8px currentColor; }
+  #hud b { font-size: 28px; display: block; }
+  #hud button { margin-top: 8px; background: none; color: inherit; border: 1px solid currentColor; padding: 4px 10px; font: inherit; letter-spacing: inherit; cursor: pointer; }
+  #bloom { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; filter: blur(16px) brightness(1.9) saturate(1.5); mix-blend-mode: screen; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<canvas id="bloom"></canvas>
+<div id="hud">Cubes<b id="n">1</b>Bounces <span id="cnt">0</span><br><button id="reset">Reset</button></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const canvas = document.getElementById('game');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+const bloom = document.getElementById('bloom'), bctx = bloom.getContext('2d');
+bloom.width = 320; bloom.height = 200;
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x05060c, 0.00045);
+const camera = new THREE.PerspectiveCamera(50, 1, 1, 6000);
+scene.add(new THREE.AmbientLight(0x8090c0, .7));
+const sun = new THREE.DirectionalLight(0xffffff, .8); sun.position.set(300, 600, 500); scene.add(sun);
+
+const border = { x: 400, y: 600, z: 400 }, SIZE = 50, MAX_CUBES = 100000000, MAX_SPEED = 24;
+const HALF = [border.x/2, border.y/2, border.z/2];
+const world = new THREE.Group(); scene.add(world);
+const add = (o = {}) => Object.assign({ transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }, o);
+const rnd = (a, b) => Math.random() * (b - a) + a, sgn = () => Math.random() < .5 ? 1 : -1;
+const color = new THREE.Color();
+
+// arena
+world.add(new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(border.x, border.y, border.z)), new THREE.LineBasicMaterial({ color: 0x66ccff })));
+const arena = world.children[0];
+const grid = (w, h, rot, pos) => { const l = new THREE.GridHelper(Math.max(w, h), 10, 0x2a4a7a, 0x16264a); l.scale.set(w/Math.max(w,h), 1, h/Math.max(w,h)); l.rotation.set(...rot); l.position.set(...pos); world.add(l); };
+grid(border.x, border.z, [0,0,0], [0,-border.y/2,0]); grid(border.x, border.y, [Math.PI/2,0,0], [0,0,-border.z/2]); grid(border.y, border.z, [0,0,Math.PI/2], [-border.x/2,0,0]);
+
+// wall flash planes
+const wm = (g, rot, pos) => { const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial(add({ opacity: 0, side: THREE.DoubleSide }))); m.rotation.set(...rot); m.position.set(...pos); world.add(m); return m; };
+const gx = new THREE.PlaneGeometry(border.z, border.y), gy = new THREE.PlaneGeometry(border.x, border.z), gz = new THREE.PlaneGeometry(border.x, border.y);
+const walls = {
+  x: [wm(gx,[0,Math.PI/2,0],[-border.x/2,0,0]), wm(gx,[0,Math.PI/2,0],[border.x/2,0,0])],
+  y: [wm(gy,[Math.PI/2,0,0],[0,border.y/2,0]), wm(gy,[Math.PI/2,0,0],[0,-border.y/2,0])],
+  z: [wm(gz,[0,0,0],[0,0,-border.z/2]), wm(gz,[0,0,0],[0,0,border.z/2])]
+};
+
+// shared geometry + glow texture
+const tex = (() => { const c = document.createElement('canvas'); c.width = c.height = 64; const x = c.getContext('2d'), g = x.createRadialGradient(32,32,0,32,32,32);
+  g.addColorStop(0,'rgba(255,255,255,1)'); g.addColorStop(.25,'rgba(255,255,255,.55)'); g.addColorStop(1,'rgba(255,255,255,0)'); x.fillStyle = g; x.fillRect(0,0,64,64); return new THREE.CanvasTexture(c); })();
+const G = { cube: new THREE.BoxGeometry(SIZE,SIZE,SIZE), shell: new THREE.BoxGeometry(64,64,64), edges: new THREE.EdgesGeometry(new THREE.BoxGeometry(51,51,51)) };
+
+// particles (shared pool)
+const N = 6000, pPos = new Float32Array(N*3), pCol = new Float32Array(N*3), pVel = new Float32Array(N*3), pLife = new Float32Array(N);
+const pGeo = new THREE.BufferGeometry();
+pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3)); pGeo.setAttribute('color', new THREE.BufferAttribute(pCol, 3));
+const pts = new THREE.Points(pGeo, new THREE.PointsMaterial(add({ size: 16, map: tex, vertexColors: true }))); pts.frustumCulled = false; world.add(pts);
+let pi = 0;
+function spawnP(at, c, count, spread, vmin, vmax, life, br) {
+  for (let k = 0; k < count; k++) {
+    const i = pi++ % N;
+    pPos.set([at.x+(Math.random()-.5)*spread, at.y+(Math.random()-.5)*spread, at.z+(Math.random()-.5)*spread], i*3);
+    const v = new THREE.Vector3(Math.random()-.5, Math.random()-.5, Math.random()-.5).normalize().multiplyScalar(rnd(vmin, vmax));
+    pVel.set([v.x, v.y, v.z], i*3); pCol.set([c.r*br, c.g*br, c.b*br], i*3); pLife[i] = life;
+  }
+}
+
+// stars
+const sp = new Float32Array(900*3);
+for (let i = 0; i < 900; i++) { const t = rnd(0,6.283), u = rnd(-1,1), r = rnd(1800,3300), s = Math.sqrt(1-u*u); sp.set([r*s*Math.cos(t), r*u, r*s*Math.sin(t)], i*3); }
+const sg = new THREE.BufferGeometry(); sg.setAttribute('position', new THREE.BufferAttribute(sp, 3));
+scene.add(new THREE.Points(sg, new THREE.PointsMaterial({ size: 3, color: 0x9ab, fog: false })));
+
+// ---- cubes: every bounce spawns another one ----
+const cubes = []; let nextId = 0, totalBounces = 0;
+function makeCube(pos, speed) {
+  const c = { id: nextId++, pos: { ...pos }, dir: { x: sgn(), y: sgn(), z: sgn() }, speed, hist: [], ghosts: [] };
+  c.mesh = new THREE.Mesh(G.cube, new THREE.MeshStandardMaterial({ roughness: .3, metalness: .5 }));
+  c.shell = new THREE.Mesh(G.shell, new THREE.MeshBasicMaterial(add({ opacity: .18 })));
+  c.mesh.add(c.shell, new THREE.LineSegments(G.edges, new THREE.LineBasicMaterial({ color: 0xffffff })));
+  c.halo = new THREE.Sprite(new THREE.SpriteMaterial(add({ map: tex }))); c.halo.scale.set(300, 300, 1);
+  world.add(c.mesh, c.halo);
+  for (let i = 0; i < 6; i++) { const g = new THREE.Mesh(G.cube, new THREE.MeshBasicMaterial(add({ wireframe: true }))); world.add(g); c.ghosts.push(g); }
+  cubes.push(c); return c;
+}
+function reset() {
+  cubes.forEach(c => { world.remove(c.mesh, c.halo); c.ghosts.forEach(g => world.remove(g)); });
+  cubes.length = 0; totalBounces = 0;
+  makeCube({ x: rnd(50,200), y: rnd(50,400), z: rnd(50,200) }, 1);
+}
+document.getElementById('reset').onclick = reset;
+
+let shake = 0;
+function step(c) {
+  c.pos.x += c.dir.x*c.speed; c.pos.y += c.dir.y*c.speed; c.pos.z += c.dir.z*c.speed;
+  const hits = [];
+  for (const a of ['x','y','z']) {
+    const lim = border[a] - SIZE;
+    if (c.pos[a] > lim) { c.pos[a] = lim; c.dir[a] = -1; hits.push([a, 1]); }      // clamp inside, point inward
+    else if (c.pos[a] < 0) { c.pos[a] = 0; c.dir[a] = 1; hits.push([a, 0]); }
+  }
+  const p = new THREE.Vector3(c.pos.x + SIZE/2 - border.x/2, -(c.pos.y + SIZE/2 - border.y/2), c.pos.z + SIZE/2 - border.z/2);
+  const h = (0.52 + c.id * 0.07 + c.speed * 0.02) % 1; color.setHSL(h, 1, .55);
+
+  c.mesh.position.copy(p); c.halo.position.copy(p);
+  c.mesh.material.color.copy(color); c.mesh.material.emissive.copy(color); c.mesh.material.emissiveIntensity = .7;
+  c.shell.material.color.copy(color); c.halo.material.color.copy(color); c.halo.material.opacity = .45 + c.speed * .015;
+  const spin = .01 * Math.min(c.speed, 12); c.mesh.rotation.x += spin; c.mesh.rotation.y += spin * 1.3;
+
+  c.hist.unshift(p.clone()); if (c.hist.length > 20) c.hist.pop();
+  c.ghosts.forEach((g, i) => {
+    g.position.copy(c.hist[Math.min((i+1)*2, c.hist.length-1)]); g.rotation.copy(c.mesh.rotation);
+    const f = 1 - i/c.ghosts.length; g.scale.setScalar(.4 + .6*f); g.material.opacity = .3*f; g.material.color.setHSL((h + i*.02) % 1, 1, .55);
+  });
+  spawnP(p, color, 2, 40, .2, 1.2, .8, .9);
+
+  for (const [a, side] of hits) {
+    c.speed = Math.min(c.speed + 1, MAX_SPEED); totalBounces++;
+    const w = walls[a][side]; w.material.color.copy(color); w.material.opacity = .5;
+    spawnP(p, color, 70, 0, 2, 12, 1, 1); shake = Math.min(shake + 2, 9);
+    if (cubes.length < MAX_CUBES) {                               // the split: a brand-new cube appears at the bounce
+      const n = makeCube(c.pos, 1 + Math.floor(Math.random()*3));
+      spawnP(p, color, 40, 0, 1, 6, .8, 1);
+    }
+  }
+}
+
+// ---- camera / input ----
+let rotX = -.3, rotY = .5, dragging = false, lx = 0, ly = 0, camZ = 1100;
+canvas.addEventListener('pointerdown', e => { dragging = true; lx = e.clientX; ly = e.clientY; canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener('pointerup', () => dragging = false);
+canvas.addEventListener('pointermove', e => { if (!dragging) return; rotY += (e.clientX-lx)*.01; rotX = Math.max(-1.4, Math.min(1.4, rotX + (e.clientY-ly)*.01)); lx = e.clientX; ly = e.clientY; });
+function resize() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); renderer.setSize(w, h, false);
+  camera.aspect = w/h; camZ = Math.max(1100, 1100/Math.min(1, camera.aspect)); camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize(); reset();
+
+function loop() {
+  const n = cubes.length; for (let i = 0; i < n; i++) step(cubes[i]);   // new cubes join next frame
+  arena.material.color.setHSL((performance.now()/20000) % 1, .8, .6);
+  for (const k in walls) walls[k].forEach(w => w.material.opacity *= .93);
+  for (let i = 0; i < N; i++) {
+    if (pLife[i] <= 0) { pCol[i*3] = pCol[i*3+1] = pCol[i*3+2] = 0; continue; }
+    pLife[i] -= .016;
+    for (let a = 0; a < 3; a++) {
+      pPos[i*3+a] += pVel[i*3+a]; pVel[i*3+a] *= .96;
+      if (pPos[i*3+a] > HALF[a]) { pPos[i*3+a] = HALF[a]; pVel[i*3+a] *= -1; } else if (pPos[i*3+a] < -HALF[a]) { pPos[i*3+a] = -HALF[a]; pVel[i*3+a] *= -1; }
+    }
+    pCol[i*3] *= .97; pCol[i*3+1] *= .97; pCol[i*3+2] *= .97;
+  }
+  pGeo.attributes.position.needsUpdate = true; pGeo.attributes.color.needsUpdate = true;
+  if (!dragging) rotY += .003;
+  world.rotation.set(rotX, rotY, 0);
+  shake *= .88; camera.position.set((Math.random()-.5)*shake, (Math.random()-.5)*shake, camZ); camera.lookAt(0, 0, 0);
+  document.getElementById('n').textContent = cubes.length + (cubes.length >= MAX_CUBES ? ' (max)' : '');
+  document.getElementById('cnt').textContent = totalBounces;
+  renderer.render(scene, camera); bctx.drawImage(canvas, 0, 0, bloom.width, bloom.height);
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
